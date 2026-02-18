@@ -17,6 +17,10 @@ OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "")
 OANDA_BASE_URL = os.environ.get("OANDA_BASE_URL", "https://api-fxtrade.oanda.com")
 OANDA_INSTRUMENT = os.environ.get("OANDA_INSTRUMENT", "XAU_USD")
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "Asia/Singapore")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+NOTIFY_ALL = os.environ.get("NOTIFY_ALL", "false").lower() == "true"
+COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "15"))
 
 RR = float(os.environ.get("RR", "2.0"))
 DEFAULT_EQUITY = float(os.environ.get("DEFAULT_EQUITY", "500"))
@@ -205,6 +209,23 @@ def compute_lots(equity: float, risk_pct: float, entry, sl) -> str:
 # -----------------------
 # Auth (simple shared password)
 # -----------------------
+def send_telegram(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        # If it fails, log status for Render logs
+        if r.status_code >= 400:
+            app.logger.error("Telegram send failed: %s %s", r.status_code, r.text[:300])
+    except Exception as e:
+        app.logger.error("Telegram error: %s", str(e))
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
@@ -252,6 +273,29 @@ def home():
 
     lots = compute_lots(equity, risk, sig["entry"], sig["sl"])
     return render_template("index.html", signal=sig, history=hist, equity=int(equity), risk=risk, lots=lots)
+        # --- Telegram notifications with cooldown ---
+        last = app.config.get("LAST_NOTIFY", {})
+        key = f"{sig['side']}_{sig['time_sgt']}"
+        now_ts = time.time()
+        can_send = True
+
+        # cooldown by side
+        last_ts = last.get(sig["side"], 0)
+        if now_ts - last_ts < COOLDOWN_MINUTES * 60:
+            can_send = False
+
+        if can_send and (NOTIFY_ALL or sig["side"] in ["BUY", "SELL"]):
+            msg = (
+                f"XAUUSD {sig['side']} (15M)\n"
+                f"Time(SGT): {sig['time_sgt']}\n"
+                f"Price: {sig['price']}\n"
+                f"Entry: {sig['entry']}  SL: {sig['sl']}  TP: {sig['tp']}  RR: {sig['rr']}\n"
+                f"Session: {sig['session']}  Score: {sig['ml_score']}\n"
+                f"Reason: {sig['reason']}"
+            )
+            send_telegram(msg)
+            last[sig["side"]] = now_ts
+            app.config["LAST_NOTIFY"] = last
 
 @app.get("/health")
 def health():
