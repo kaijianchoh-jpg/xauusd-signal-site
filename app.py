@@ -4,7 +4,6 @@ import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-import numpy as np
 import pandas as pd
 import requests
 from flask import Flask, request, session, redirect, render_template
@@ -21,10 +20,9 @@ APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "Asia/Singapore")
 RR = float(os.environ.get("RR", "2.0"))
 DEFAULT_EQUITY = float(os.environ.get("DEFAULT_EQUITY", "500"))
 
-# Your tick info (per 1.00 lot): tick size 0.01, tick value $1
+# Tick info (per 1.00 lot): tick size 0.01, tick value $1
 TICK_SIZE = float(os.environ.get("XAUUSD_TICK_SIZE", "0.01"))
 TICK_VALUE = float(os.environ.get("XAUUSD_TICK_VALUE", "1.0"))
-
 DOLLARS_PER_1USD_MOVE_PER_LOT = (1.0 / TICK_SIZE) * TICK_VALUE  # 100 when 0.01 & 1.0
 
 # Telegram
@@ -32,6 +30,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 NOTIFY_ALL = os.environ.get("NOTIFY_ALL", "false").lower() == "true"
 COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "15"))
+
+# Cron trigger
+CRON_KEY = os.environ.get("CRON_KEY", "")
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
@@ -129,12 +130,14 @@ def compute_signal():
     price = float(last["c"])
     a = float(last["atr14"]) if not math.isnan(last["atr14"]) else 2.0
 
+    # Simple sweep + reclaim/reject
     swept_low = (prev["l"] < lo.iloc[-2]) and (last["c"] > lo.iloc[-2])
     swept_high = (prev["h"] > hi.iloc[-2]) and (last["c"] < hi.iloc[-2])
 
     mom_up = last["c"] > last["ema50"]
     mom_dn = last["c"] < last["ema50"]
 
+    # MVP "score" (confluence score; replace with real ML later)
     score = 0.5
     reason = []
     if bias == "BULL":
@@ -190,7 +193,7 @@ def compute_signal():
         "rr": RR,
         "ml_score": round(float(min(max(score, 0.0), 1.0)), 2),
         "session": sess,
-        "reason": ", ".join(reason[:6]),
+        "reason": ", ".join(reason[:8]),
     }
     return out
 
@@ -207,18 +210,26 @@ def compute_lots(equity: float, risk_pct: float, entry, sl) -> str:
     return f"{max(lots, 0.0):.2f}"
 
 def maybe_notify(sig: dict):
-    # Cooldown by side (BUY/SELL/NO_TRADE)
+    # cooldown by side
     last = app.config.get("LAST_NOTIFY", {})
     now_ts = time.time()
     last_ts = last.get(sig["side"], 0)
     can_send = (now_ts - last_ts) >= COOLDOWN_MINUTES * 60
-
     if not can_send:
+        return
+
+    # Reduce NO_TRADE spam: only notify NO_TRADE if it is a state change
+    prev_side = app.config.get("PREV_SIDE")
+    if sig["side"] == "NO_TRADE" and prev_side == "NO_TRADE":
+        # don't repeat NO_TRADE
+        last[sig["side"]] = now_ts
+        app.config["LAST_NOTIFY"] = last
+        app.config["PREV_SIDE"] = sig["side"]
         return
 
     if NOTIFY_ALL or sig["side"] in ["BUY", "SELL"]:
         msg = (
-            f"XAUUSD {sig['side']} (15M)\n"
+            f"XAUUSD {sig.get('type','')}".strip() + f" {sig['side']} (15M)\n"
             f"Time(SGT): {sig['time_sgt']}\n"
             f"Price: {sig['price']}\n"
             f"Entry: {sig['entry']}  SL: {sig['sl']}  TP: {sig['tp']}  RR: {sig['rr']}\n"
@@ -229,6 +240,7 @@ def maybe_notify(sig: dict):
 
     last[sig["side"]] = now_ts
     app.config["LAST_NOTIFY"] = last
+    app.config["PREV_SIDE"] = sig["side"]
 
 # -----------------------
 # Auth (simple shared password)
@@ -258,6 +270,31 @@ def logout():
     session.clear()
     return redirect("/login")
 
+@app.get("/cron/run")
+def cron_run():
+    key = request.args.get("key", "")
+    if not CRON_KEY or key != CRON_KEY:
+        return {"ok": False, "error": "unauthorized"}, 401
+
+    now_utc = datetime.now(timezone.utc)
+    minute_sgt = now_utc.astimezone(ZoneInfo(APP_TIMEZONE)).minute
+    is_confirmed = (minute_sgt % 15 == 0)
+
+    sig = compute_signal()
+    sig["type"] = "CONFIRMED" if is_confirmed else "HEADSUP"
+
+    # Notify: always for CONFIRMED, heads-up only if NOTIFY_ALL=true
+    if sig["type"] == "CONFIRMED" or NOTIFY_ALL:
+        maybe_notify(sig)
+
+    # Save latest + history for homepage
+    app.config["LATEST_SIGNAL"] = sig
+    hist = app.config.get("HISTORY", [])
+    hist = ([sig] + hist)[:60]
+    app.config["HISTORY"] = hist
+
+    return {"ok": True, "type": sig["type"], "side": sig["side"], "time_sgt": sig["time_sgt"]}
+
 @app.route("/")
 def home():
     if not session.get("authed"):
@@ -266,19 +303,16 @@ def home():
     equity = float(request.args.get("equity", DEFAULT_EQUITY))
     risk = int(request.args.get("risk", "1"))
 
-    now = time.time()
-    cache = app.config.get("CACHE")
-
-    if not cache or now - cache["ts"] > 60:
+    sig = app.config.get("LATEST_SIGNAL")
+    if not sig:
+        # fallback if cron hasn't run yet
         sig = compute_signal()
-        maybe_notify(sig)
-
+        sig["type"] = "ON_DEMAND"
+        app.config["LATEST_SIGNAL"] = sig
         hist = app.config.get("HISTORY", [])
-        hist = ([sig] + hist)[:30]
+        hist = ([sig] + hist)[:60]
         app.config["HISTORY"] = hist
-        app.config["CACHE"] = {"ts": now, "sig": sig}
     else:
-        sig = cache["sig"]
         hist = app.config.get("HISTORY", [sig])
 
     lots = compute_lots(equity, risk, sig["entry"], sig["sl"])
