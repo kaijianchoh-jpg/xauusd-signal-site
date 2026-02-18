@@ -262,7 +262,34 @@ def home():
     now = time.time()
     cache = app.config.get("CACHE")
     if not cache or now - cache["ts"] > 60:
-        sig = compute_signal()
+        sig = compute_signal()          
+        
+        # --- Telegram notifications with cooldown ---
+        last = app.config.get("LAST_NOTIFY", {})
+        now_ts = time.time()
+
+        # cooldown by side
+        last_ts = last.get(sig["side"], 0)
+        can_send = (now_ts - last_ts) >= COOLDOWN_MINUTES * 60
+
+        if can_send and (NOTIFY_ALL or sig["side"] in ["BUY", "SELL"]):
+            msg = (
+                f"XAUUSD {sig['side']} (15M)\n"
+                f"Time(SGT): {sig['time_sgt']}\n"
+                f"Price: {sig['price']}\n"
+                f"Entry: {sig['entry']}  SL: {sig['sl']}  TP: {sig['tp']}  RR: {sig['rr']}\n"
+                f"Session: {sig['session']}  Score: {sig['ml_score']}\n"
+                f"Reason: {sig['reason']}"
+            )
+            send_telegram(msg)
+            last[sig["side"]] = now_ts
+            app.config["LAST_NOTIFY"] = last
+
+        hist = app.config.get("HISTORY", [])
+        hist = ([sig] + hist)[:30]
+        app.config["HISTORY"] = hist
+        app.config["CACHE"] = {"ts": now, "sig": sig}
+
         hist = app.config.get("HISTORY", [])
         hist = ([sig] + hist)[:30]
         app.config["HISTORY"] = hist
