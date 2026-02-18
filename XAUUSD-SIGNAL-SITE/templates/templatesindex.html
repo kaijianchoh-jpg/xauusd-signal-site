@@ -1,0 +1,105 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>XAUUSD Signals</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#0b0f17; color:#e8eefc; margin:0; }
+    .wrap { max-width: 900px; margin: 0 auto; padding: 24px; }
+    .card { background:#111a2e; border:1px solid #1f2a44; border-radius:14px; padding:16px; margin:12px 0; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
+    .pill { padding:6px 10px; border-radius:999px; font-size:12px; background:#1f2a44; }
+    .big { font-size: 36px; font-weight: 800; }
+    input, select { padding:10px; border-radius:10px; border:1px solid #1f2a44; background:#0b0f17; color:#e8eefc; }
+    button { padding:10px 14px; border-radius:10px; border:0; background:#3b82f6; color:white; font-weight:700; cursor:pointer; }
+    .muted { color:#a9b7d6; font-size: 12px; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { border-bottom:1px solid #1f2a44; padding:10px; text-align:left; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="row" style="justify-content:space-between; align-items:center;">
+        <div>
+          <div class="pill">SGT Sessions • 15M • RR 1:2 • OANDA XAU_USD</div>
+          <div class="big">{{ signal.side }}</div>
+          <div class="muted">Updated: {{ signal.time_sgt }} • ML score: {{ signal.ml_score }}</div>
+        </div>
+        <div>
+          <form method="post" action="/logout"><button type="submit">Logout</button></form>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div style="flex:1; min-width: 240px;">
+          <div class="muted">Reference Price</div>
+          <div style="font-size:22px; font-weight:800;">{{ signal.price }}</div>
+        </div>
+        <div style="flex:1; min-width: 240px;">
+          <div class="muted">Entry / SL / TP</div>
+          <div style="font-size:14px;">
+            Entry: <b>{{ signal.entry }}</b><br/>
+            SL: <b>{{ signal.sl }}</b><br/>
+            TP: <b>{{ signal.tp }}</b>
+          </div>
+        </div>
+        <div style="flex:1; min-width: 240px;">
+          <div class="muted">Reason</div>
+          <div style="font-size:14px;">{{ signal.reason }}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="muted">Risk Calculator (Pepperstone-like tick: 0.01 = $1 per lot)</div>
+      <form class="row" method="get" action="/">
+        <div>
+          <div class="muted">Equity</div>
+          <input name="equity" value="{{ equity }}" />
+        </div>
+        <div>
+          <div class="muted">Risk %</div>
+          <select name="risk">
+            <option value="1" {% if risk == 1 %}selected{% endif %}>1%</option>
+            <option value="2" {% if risk == 2 %}selected{% endif %}>2%</option>
+          </select>
+        </div>
+        <div>
+          <div class="muted">Lots (suggested)</div>
+          <input value="{{ lots }}" readonly />
+        </div>
+        <div style="align-self:end;">
+          <button type="submit">Recalculate</button>
+        </div>
+      </form>
+      <div class="muted">Note: Execute on Pepperstone MT5; prices may differ slightly from OANDA reference.</div>
+    </div>
+
+    <div class="card">
+      <div class="muted">Recent signals</div>
+      <table>
+        <thead>
+          <tr><th>Time (SGT)</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th><th>Score</th></tr>
+        </thead>
+        <tbody>
+          {% for r in history %}
+          <tr>
+            <td>{{ r.time_sgt }}</td>
+            <td><b>{{ r.side }}</b></td>
+            <td>{{ r.entry }}</td>
+            <td>{{ r.sl }}</td>
+            <td>{{ r.tp }}</td>
+            <td>{{ r.ml_score }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+  </div>
+</body>
+</html>
