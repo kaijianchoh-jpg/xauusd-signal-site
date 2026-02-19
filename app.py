@@ -33,6 +33,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 NOTIFY_ALL = os.environ.get("NOTIFY_ALL", "false").lower() == "true"
 COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "15"))
 
+# NO_TRADE plan-change threshold (gold dollars)
+NO_TRADE_CHANGE_THRESHOLD = 0.30
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
@@ -62,8 +65,7 @@ def fetch_candles(granularity: str, count: int = 500) -> pd.DataFrame:
             {"time": t, "o": float(m["o"]), "h": float(m["h"]), "l": float(m["l"]), "c": float(m["c"])}
         )
 
-    df = pd.DataFrame(rows).set_index("time").sort_index()
-    return df
+    return pd.DataFrame(rows).set_index("time").sort_index()
 
 def ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(span=n, adjust=False).mean()
@@ -77,7 +79,6 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return tr.rolling(n).mean()
 
 def session_tag(dt_utc: datetime) -> str:
-    # Simple session buckets in SGT (MVP)
     h = dt_utc.astimezone(ZoneInfo(APP_TIMEZONE)).hour
     if 7 <= h < 15:
         return "ASIA"
@@ -109,6 +110,7 @@ def compute_signal():
     df1h = fetch_candles("H1", 400)
     df4h = fetch_candles("H4", 400)
 
+    # Indicators
     df15["ema50"] = ema(df15["c"], 50)
     df15["ema200"] = ema(df15["c"], 200)
     df15["atr14"] = atr(df15, 14)
@@ -119,6 +121,7 @@ def compute_signal():
     df4h["ema50"] = ema(df4h["c"], 50)
     df4h["ema200"] = ema(df4h["c"], 200)
 
+    # HTF bias
     bull = (df1h["ema50"].iloc[-1] > df1h["ema200"].iloc[-1]) and (df4h["ema50"].iloc[-1] > df4h["ema200"].iloc[-1])
     bear = (df1h["ema50"].iloc[-1] < df1h["ema200"].iloc[-1]) and (df4h["ema50"].iloc[-1] < df4h["ema200"].iloc[-1])
     bias = "NEUTRAL"
@@ -127,20 +130,21 @@ def compute_signal():
     elif bear:
         bias = "BEAR"
 
+    # Structure proxy
     hi, lo = swing_levels(df15, 20)
     last = df15.iloc[-1]
     prev = df15.iloc[-2]
     price = float(last["c"])
     a = float(last["atr14"]) if not math.isnan(last["atr14"]) else 2.0
 
-    # Simple sweep + reclaim/reject
+    # Sweep + reclaim/reject
     swept_low = (prev["l"] < lo.iloc[-2]) and (last["c"] > lo.iloc[-2])
     swept_high = (prev["h"] > hi.iloc[-2]) and (last["c"] < hi.iloc[-2])
 
     mom_up = last["c"] > last["ema50"]
     mom_dn = last["c"] < last["ema50"]
 
-    # MVP "score" (confluence score; replace with real ML later)
+    # MVP "score" (confluence score)
     score = 0.5
     reason = []
     if bias == "BULL":
@@ -171,12 +175,14 @@ def compute_signal():
     side = "NO_TRADE"
     entry = sl = tp = None
 
+    # Confirmed BUY/SELL
     if swept_low and (bias in ["BULL", "NEUTRAL"]) and mom_up and score >= thresh:
         side = "BUY"
         entry = price
         base_sl = float(min(df15["l"].iloc[-6:]))
         sl = base_sl - (a * 0.4)
         tp = entry + RR * (entry - sl)
+
     elif swept_high and (bias in ["BEAR", "NEUTRAL"]) and mom_dn and score >= thresh:
         side = "SELL"
         entry = price
@@ -184,19 +190,37 @@ def compute_signal():
         sl = base_sl + (a * 0.4)
         tp = entry - RR * (sl - entry)
 
+    # POTENTIAL plan even if NO_TRADE (for display + optional notifications)
+    if side == "NO_TRADE":
+        entry = price
+        if bias == "BULL":
+            base_sl = float(min(df15["l"].iloc[-6:]))
+            sl = base_sl - (a * 0.4)
+            tp = entry + RR * (entry - sl)
+            reason.append("POTENTIAL_BUY_PLAN")
+        elif bias == "BEAR":
+            base_sl = float(max(df15["h"].iloc[-6:]))
+            sl = base_sl + (a * 0.4)
+            tp = entry - RR * (sl - entry)
+            reason.append("POTENTIAL_SELL_PLAN")
+        else:
+            sl = entry - (a * 1.0)
+            tp = entry + RR * (entry - sl)
+            reason.append("POTENTIAL_NEUTRAL_PLAN")
+
     out = {
         "time_utc": now_utc,
         "time_sgt": sgt(now_utc),
         "symbol": "XAUUSD",
         "price": round(price, 2),
         "side": side,
-        "entry": round(entry, 2) if entry is not None else "-",
-        "sl": round(sl, 2) if sl is not None else "-",
-        "tp": round(tp, 2) if tp is not None else "-",
+        "entry": round(float(entry), 2) if entry is not None else "-",
+        "sl": round(float(sl), 2) if sl is not None else "-",
+        "tp": round(float(tp), 2) if tp is not None else "-",
         "rr": RR,
         "ml_score": round(float(min(max(score, 0.0), 1.0)), 2),
         "session": sess,
-        "reason": ", ".join(reason[:8]),
+        "reason": ", ".join(reason[:10]),
     }
     return out
 
@@ -220,14 +244,22 @@ def maybe_notify(sig: dict):
     if (now_ts - last_ts) < COOLDOWN_MINUTES * 60:
         return
 
-    # Reduce NO_TRADE spam: only notify NO_TRADE on state change
-    prev_side = app.config.get("PREV_SIDE")
-    if sig["side"] == "NO_TRADE" and prev_side == "NO_TRADE":
-        last[sig["side"]] = now_ts
-        app.config["LAST_NOTIFY"] = last
-        app.config["PREV_SIDE"] = sig["side"]
-        return
+    # If NO_TRADE, only notify if plan changed enough
+    if sig["side"] == "NO_TRADE":
+        prev = app.config.get("PREV_PLAN", {})
+        price_change = abs(float(sig["price"]) - float(prev.get("price", sig["price"])))
+        entry_change = abs(float(sig["entry"]) - float(prev.get("entry", sig["entry"])))
+        sl_change = abs(float(sig["sl"]) - float(prev.get("sl", sig["sl"])))
+        tp_change = abs(float(sig["tp"]) - float(prev.get("tp", sig["tp"])))
 
+        if max(price_change, entry_change, sl_change, tp_change) < NO_TRADE_CHANGE_THRESHOLD:
+            last[sig["side"]] = now_ts
+            app.config["LAST_NOTIFY"] = last
+            return
+
+        app.config["PREV_PLAN"] = {"price": sig["price"], "entry": sig["entry"], "sl": sig["sl"], "tp": sig["tp"]}
+
+    # Send messages
     if NOTIFY_ALL or sig["side"] in ["BUY", "SELL"]:
         msg = (
             f"XAUUSD {sig['side']} (15M)\n"
@@ -241,7 +273,6 @@ def maybe_notify(sig: dict):
 
     last[sig["side"]] = now_ts
     app.config["LAST_NOTIFY"] = last
-    app.config["PREV_SIDE"] = sig["side"]
 
 # -----------------------
 # Auth (simple shared password)
@@ -279,7 +310,7 @@ def home():
     equity = float(request.args.get("equity", DEFAULT_EQUITY))
     risk = int(request.args.get("risk", "1"))
 
-    # Recompute at most once per 60 seconds, so refresh doesn't spam OANDA
+    # Recompute at most once per 60 seconds to avoid spamming OANDA
     now = time.time()
     cache = app.config.get("CACHE")
 
