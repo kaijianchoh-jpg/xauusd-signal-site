@@ -31,7 +31,10 @@ DOLLARS_PER_1USD_MOVE_PER_LOT = (1.0 / TICK_SIZE) * TICK_VALUE  # 100 when 0.01 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 NOTIFY_ALL = os.environ.get("NOTIFY_ALL", "false").lower() == "true"
-COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "15"))
+COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "3"))
+
+# Auto-update trigger (UptimeRobot will call this)
+PING_KEY = os.environ.get("PING_KEY", "")
 
 # NO_TRADE plan-change threshold (gold dollars)
 NO_TRADE_CHANGE_THRESHOLD = 0.30
@@ -122,8 +125,12 @@ def compute_signal():
     df4h["ema200"] = ema(df4h["c"], 200)
 
     # HTF bias
-    bull = (df1h["ema50"].iloc[-1] > df1h["ema200"].iloc[-1]) and (df4h["ema50"].iloc[-1] > df4h["ema200"].iloc[-1])
-    bear = (df1h["ema50"].iloc[-1] < df1h["ema200"].iloc[-1]) and (df4h["ema50"].iloc[-1] < df4h["ema200"].iloc[-1])
+    bull = (df1h["ema50"].iloc[-1] > df1h["ema200"].iloc[-1]) and (
+        df4h["ema50"].iloc[-1] > df4h["ema200"].iloc[-1]
+    )
+    bear = (df1h["ema50"].iloc[-1] < df1h["ema200"].iloc[-1]) and (
+        df4h["ema50"].iloc[-1] < df4h["ema200"].iloc[-1]
+    )
     bias = "NEUTRAL"
     if bull:
         bias = "BULL"
@@ -190,7 +197,7 @@ def compute_signal():
         sl = base_sl + (a * 0.4)
         tp = entry - RR * (sl - entry)
 
-    # POTENTIAL plan even if NO_TRADE (for display + optional notifications)
+    # POTENTIAL plan even if NO_TRADE
     if side == "NO_TRADE":
         entry = price
         if bias == "BULL":
@@ -233,7 +240,7 @@ def compute_lots(equity: float, risk_pct: float, entry, sl) -> str:
         return "-"
     loss_per_lot = sl_dist * DOLLARS_PER_1USD_MOVE_PER_LOT
     lots = risk_usd / loss_per_lot
-    lots = math.floor(lots / 0.01) * 0.01  # 0.01 lot steps
+    lots = math.floor(lots / 0.01) * 0.01
     return f"{max(lots, 0.0):.2f}"
 
 def maybe_notify(sig: dict):
@@ -259,10 +266,9 @@ def maybe_notify(sig: dict):
 
         app.config["PREV_PLAN"] = {"price": sig["price"], "entry": sig["entry"], "sl": sig["sl"], "tp": sig["tp"]}
 
-    # Send messages
     if NOTIFY_ALL or sig["side"] in ["BUY", "SELL"]:
         msg = (
-            f"XAUUSD {sig['side']} (15M)\n"
+            f"XAUUSD {sig.get('type','')}".strip() + f" {sig['side']} (15M)\n"
             f"Time(SGT): {sig['time_sgt']}\n"
             f"Price: {sig['price']}\n"
             f"Entry: {sig['entry']}  SL: {sig['sl']}  TP: {sig['tp']}  RR: {sig['rr']}\n"
@@ -275,7 +281,7 @@ def maybe_notify(sig: dict):
     app.config["LAST_NOTIFY"] = last
 
 # -----------------------
-# Auth (simple shared password)
+# Auth (shared password)
 # -----------------------
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -302,6 +308,28 @@ def logout():
     session.clear()
     return redirect("/login")
 
+# -----------------------
+# UptimeRobot trigger
+# -----------------------
+@app.get("/ping/run")
+def ping_run():
+    key = request.args.get("key", "")
+    if not PING_KEY or key != PING_KEY:
+        return {"ok": False, "error": "unauthorized"}, 401
+
+    sig = compute_signal()
+    sig["type"] = "AUTO"
+
+    maybe_notify(sig)
+
+    # Update cache/history for the website
+    app.config["CACHE"] = {"ts": time.time(), "sig": sig}
+    hist = app.config.get("HISTORY", [])
+    hist = ([sig] + hist)[:60]
+    app.config["HISTORY"] = hist
+
+    return {"ok": True, "side": sig["side"], "time_sgt": sig["time_sgt"]}
+
 @app.route("/")
 def home():
     if not session.get("authed"):
@@ -310,21 +338,14 @@ def home():
     equity = float(request.args.get("equity", DEFAULT_EQUITY))
     risk = int(request.args.get("risk", "1"))
 
-    # Recompute at most once per 60 seconds to avoid spamming OANDA
-    now = time.time()
     cache = app.config.get("CACHE")
-
-    if not cache or now - cache["ts"] > 60:
+    if not cache:
         sig = compute_signal()
-        sig["type"] = "REFRESH"
-
-        # Notify on refresh (cooldown applies)
-        maybe_notify(sig)
-
+        sig["type"] = "ON_DEMAND"
+        app.config["CACHE"] = {"ts": time.time(), "sig": sig}
         hist = app.config.get("HISTORY", [])
         hist = ([sig] + hist)[:60]
         app.config["HISTORY"] = hist
-        app.config["CACHE"] = {"ts": now, "sig": sig}
     else:
         sig = cache["sig"]
         hist = app.config.get("HISTORY", [sig])
